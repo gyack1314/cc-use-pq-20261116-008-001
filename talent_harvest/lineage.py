@@ -24,6 +24,7 @@ class Lineage:
             fields = self._field_changes(previous["record"] if previous else None, row["record"])
             entries.append({"observation_id": row["id"], "batch": row["batch"],
                             "page": row["ordinal"], "version": row["version"],
+                            "source_revision": row["source_revision"],
                             "captured_at": row["captured_at"], "observed_at": row["observed_at"],
                             "identity": row["identity"], "status": row["status"],
                             "reasons": row["reasons"], "raw_digest": row["raw_digest"],
@@ -58,6 +59,7 @@ class Lineage:
             pages.append({"ordinal": page["ordinal"], "path": page["path"],
                           "sha256": page["digest"], "state": page["state"],
                           "attempts": page["attempts"],
+                          "source_revision": page["source_revision"],
                           "observations": [{"id": row["id"], "record_id": row["record_id"],
                                             "identity": row["identity"], "version": row["version"],
                                             "status": row["status"], "raw_digest": row["raw_digest"]}

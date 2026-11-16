@@ -25,6 +25,7 @@ def _latest_per_source(rows: list[dict]) -> list[dict]:
 def _project(row: dict) -> dict:
     return {"source": row["source"], "source_record_id": row["record_id"],
             "batch": row["batch"], "page": row["ordinal"], "version": row["version"],
+            "source_revision": row["source_revision"],
             "captured_at": row["captured_at"], "observed_at": row["observed_at"],
             "status": row["status"], "reasons": row["reasons"], "trust": row["trust"],
             "record": row["record"], "raw_digest": row["raw_digest"]}

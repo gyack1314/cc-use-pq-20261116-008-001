@@ -56,11 +56,12 @@ class Operations:
         batch = self.ledger.batch(manifest.source, manifest.batch)
         if batch["state"] != "complete":
             raise HarvestError("replay_incomplete", "batch must be complete")
-        source = self.ledger.source(manifest.source)
         differences = []
         for page in manifest.pages:
             location = f"{manifest.source}/{manifest.batch}/{page.ordinal}"
             try:
+                binding = self.ledger.page(manifest.source, manifest.batch, page.ordinal)
+                source = self.ledger.source_at(manifest.source, binding["source_revision"])
                 mirror = read_page(manifest_file.parent, page)
                 raw_rows = extract(mirror.body, source)
                 records = normalize_page(source, raw_rows)
@@ -97,6 +98,7 @@ class Operations:
                           "batch": row["batch"], "page": row["ordinal"],
                           "record_id": row["record_id"], "identity": row["identity"],
                           "version": row["version"], "status": row["status"],
+                          "source_revision": row["source_revision"],
                           "reasons": json.loads(row["reasons"]),
                           "record": json.loads(row["record_json"]),
                           "withdrawn_at": row["withdrawn_at"]})

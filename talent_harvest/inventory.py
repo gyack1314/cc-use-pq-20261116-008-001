@@ -70,6 +70,7 @@ class Inventory:
                           "page": row["ordinal"], "path": row["path"],
                           "expected_sha256": row["digest"], "state": row["state"],
                           "attempts": row["attempts"], "last_error": row["error_code"],
+                          "source_revision": row["source_revision"],
                           "manifest_hash": row["manifest_hash"], "action": action})
         return {"tasks": tasks, "retryable": sum(item["action"] == "retry" for item in tasks),
                 "blocked": sum(item["action"] != "retry" for item in tasks)}

@@ -8,7 +8,7 @@ from typing import Iterator
 import json
 import sqlite3
 
-from .contracts import HarvestError, Manifest, Record, Source, canonical
+from .contracts import HarvestError, Manifest, Record, Source, canonical, content_digest
 from .intake import manifest_digest
 
 
@@ -18,6 +18,13 @@ CREATE TABLE IF NOT EXISTS sources (
  key TEXT PRIMARY KEY, name TEXT NOT NULL, format TEXT NOT NULL,
  kind TEXT NOT NULL, field_map TEXT NOT NULL, trust INTEGER NOT NULL,
  revision INTEGER NOT NULL DEFAULT 1, withdrawn_at TEXT
+);
+CREATE TABLE IF NOT EXISTS source_revisions (
+ source TEXT NOT NULL REFERENCES sources(key), revision INTEGER NOT NULL,
+ name TEXT NOT NULL, format TEXT NOT NULL, kind TEXT NOT NULL,
+ field_map TEXT NOT NULL, trust INTEGER NOT NULL,
+ declaration_hash TEXT NOT NULL, registered_at TEXT NOT NULL,
+ PRIMARY KEY(source,revision)
 );
 CREATE TABLE IF NOT EXISTS batches (
  source TEXT NOT NULL REFERENCES sources(key), batch TEXT NOT NULL,
@@ -31,6 +38,7 @@ CREATE TABLE IF NOT EXISTS pages (
  path TEXT NOT NULL, digest TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending',
  attempts INTEGER NOT NULL DEFAULT 0, error_code TEXT, error_detail TEXT,
  processed_at TEXT, record_count INTEGER NOT NULL DEFAULT 0,
+ source_revision INTEGER NOT NULL,
  PRIMARY KEY(source,batch,ordinal),
  FOREIGN KEY(source,batch) REFERENCES batches(source,batch)
 );
@@ -40,6 +48,7 @@ CREATE TABLE IF NOT EXISTS observations (
  record_json TEXT NOT NULL, raw_json TEXT NOT NULL, raw_digest TEXT NOT NULL,
  status TEXT NOT NULL, reasons TEXT NOT NULL, version INTEGER NOT NULL,
  captured_at TEXT NOT NULL, observed_at TEXT NOT NULL,
+ source_revision INTEGER NOT NULL,
  UNIQUE(source,batch,ordinal,record_id),
  FOREIGN KEY(source,batch,ordinal) REFERENCES pages(source,batch,ordinal)
 );
@@ -70,6 +79,34 @@ class Ledger:
         self.db.row_factory = Row
         self.db.executescript(SCHEMA)
         self.db.execute("PRAGMA busy_timeout=30000")
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Bring pre-versioning databases forward: bind pages and observations
+        to the source revision that was current when they were recorded."""
+        page_columns = {row[1] for row in self.db.execute("PRAGMA table_info(pages)")}
+        if "source_revision" not in page_columns:
+            self.db.execute("ALTER TABLE pages ADD COLUMN source_revision INTEGER")
+            self.db.execute("UPDATE pages SET source_revision=(SELECT revision FROM sources WHERE sources.key=pages.source)")
+        observation_columns = {row[1] for row in self.db.execute("PRAGMA table_info(observations)")}
+        if "source_revision" not in observation_columns:
+            self.db.execute("ALTER TABLE observations ADD COLUMN source_revision INTEGER")
+            self.db.execute("""UPDATE observations SET source_revision=(
+                               SELECT p.source_revision FROM pages p
+                               WHERE p.source=observations.source AND p.batch=observations.batch
+                               AND p.ordinal=observations.ordinal)""")
+        for row in self.db.execute("SELECT * FROM sources").fetchall():
+            document = {"key": row["key"], "name": row["name"], "format": row["format"],
+                        "kind": row["kind"], "field_map": json.loads(row["field_map"]),
+                        "trust": row["trust"]}
+            # Legacy rows only kept the current declaration; earlier revisions differed
+            # at most in name/trust (the contract was frozen), so backfill the chain
+            # with the recoverable declaration.
+            for revision in range(1, row["revision"] + 1):
+                self.db.execute("INSERT OR IGNORE INTO source_revisions(source,revision,name,format,kind,field_map,trust,declaration_hash,registered_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                                (row["key"], revision, row["name"], row["format"], row["kind"],
+                                 row["field_map"], row["trust"], content_digest(document), utc_now()))
+        self.db.commit()
 
     def close(self) -> None:
         self.db.close()
@@ -96,6 +133,7 @@ class Ledger:
                         (kind, source, batch, ordinal, canonical(payload), utc_now()))
 
     def register(self, source: Source) -> dict:
+        declaration_hash = content_digest(source.document())
         with self.transaction():
             old = self.db.execute("SELECT * FROM sources WHERE key=?", (source.key,)).fetchone()
             if old:
@@ -106,32 +144,74 @@ class Ledger:
                                 "trust": old["trust"]}
                 if old_document == source.document():
                     return {"source": source.key, "revision": old["revision"], "unchanged": True}
-                count = self.db.execute("SELECT count(*) FROM batches WHERE source=?", (source.key,)).fetchone()[0]
-                if count and (old["format"] != source.format or old["kind"] != source.kind
-                              or json.loads(old["field_map"]) != source.field_map):
-                    raise HarvestError("source_contract_frozen", "format, kind, and field map cannot change after intake")
                 revision = old["revision"] + 1
-                self.db.execute("UPDATE sources SET name=?,trust=?,revision=? WHERE key=?",
-                                (source.name, source.trust, revision, source.key))
-                self.event("source_revised", source.key, None, None, {"revision": revision})
+                self.db.execute("UPDATE sources SET name=?,format=?,kind=?,field_map=?,trust=?,revision=? WHERE key=?",
+                                (source.name, source.format, source.kind, canonical(source.field_map),
+                                 source.trust, revision, source.key))
+                self._store_revision(source, revision, declaration_hash)
+                self.event("source_revised", source.key, None, None,
+                           {"revision": revision, "declaration_hash": declaration_hash})
                 return {"source": source.key, "revision": revision, "unchanged": False}
             self.db.execute("INSERT INTO sources(key,name,format,kind,field_map,trust) VALUES(?,?,?,?,?,?)",
                             (source.key, source.name, source.format, source.kind,
                              canonical(source.field_map), source.trust))
-            self.event("source_registered", source.key, None, None, source.document())
+            self._store_revision(source, 1, declaration_hash)
+            self.event("source_registered", source.key, None, None,
+                       {**source.document(), "declaration_hash": declaration_hash})
             return {"source": source.key, "revision": 1, "unchanged": False}
 
-    def source(self, key: str) -> Source:
-        row = self.db.execute("SELECT * FROM sources WHERE key=?", (key,)).fetchone()
+    def _store_revision(self, source: Source, revision: int, declaration_hash: str) -> None:
+        self.db.execute("INSERT INTO source_revisions(source,revision,name,format,kind,field_map,trust,declaration_hash,registered_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                        (source.key, revision, source.name, source.format, source.kind,
+                         canonical(source.field_map), source.trust, declaration_hash, utc_now()))
+
+    def current_revision(self, key: str) -> int:
+        row = self.db.execute("SELECT revision,withdrawn_at FROM sources WHERE key=?", (key,)).fetchone()
         if row is None:
             raise HarvestError("source_unknown", key)
         if row["withdrawn_at"]:
             raise HarvestError("source_withdrawn", key)
-        return Source(row["key"], row["name"], row["format"], row["kind"],
+        return row["revision"]
+
+    def source(self, key: str) -> Source:
+        return self.source_at(key, self.current_revision(key))
+
+    def source_at(self, key: str, revision: int) -> Source:
+        row = self.db.execute("SELECT * FROM source_revisions WHERE source=? AND revision=?",
+                              (key, revision)).fetchone()
+        if row is None:
+            raise HarvestError("source_revision_unknown", f"{key}@{revision}")
+        return Source(row["source"], row["name"], row["format"], row["kind"],
                       json.loads(row["field_map"]), row["trust"])
 
+    def revisions(self, key: str) -> dict:
+        row = self.db.execute("SELECT revision,withdrawn_at FROM sources WHERE key=?", (key,)).fetchone()
+        if row is None:
+            raise HarvestError("source_unknown", key)
+        entries = []
+        for item in self.db.execute("SELECT * FROM source_revisions WHERE source=? ORDER BY revision", (key,)):
+            entries.append({"revision": item["revision"], "name": item["name"],
+                            "format": item["format"], "kind": item["kind"],
+                            "field_map": json.loads(item["field_map"]), "trust": item["trust"],
+                            "declaration_hash": item["declaration_hash"],
+                            "registered_at": item["registered_at"],
+                            "current": item["revision"] == row["revision"]})
+        return {"source": key, "current_revision": row["revision"],
+                "withdrawn_at": row["withdrawn_at"], "revisions": entries}
+
     def ensure_batch(self, manifest: Manifest) -> dict:
-        self.source(manifest.source)
+        current = self.current_revision(manifest.source)
+        bindings: list[int] = []
+        for page in manifest.pages:
+            revision = page.source_revision if page.source_revision is not None else current
+            if not 1 <= revision <= current:
+                raise HarvestError("source_revision_unknown", f"{manifest.source}@{revision}")
+            bindings.append(revision)
+        known = {row[0] for row in self.db.execute(
+            "SELECT revision FROM source_revisions WHERE source=?", (manifest.source,))}
+        for revision in bindings:
+            if revision not in known:
+                raise HarvestError("source_revision_unknown", f"{manifest.source}@{revision}")
         digest = manifest_digest(manifest)
         with self.transaction():
             existing = self.db.execute("SELECT * FROM batches WHERE source=? AND batch=?",
@@ -143,11 +223,12 @@ class Ledger:
             self.db.execute("INSERT INTO batches(source,batch,captured_at,manifest_hash,manifest_json,started_at) VALUES(?,?,?,?,?,?)",
                             (manifest.source, manifest.batch, manifest.captured_at, digest,
                              canonical(manifest.document()), utc_now()))
-            self.db.executemany("INSERT INTO pages(source,batch,ordinal,path,digest) VALUES(?,?,?,?,?)",
-                                [(manifest.source, manifest.batch, p.ordinal, p.path, p.sha256)
-                                 for p in manifest.pages])
+            self.db.executemany("INSERT INTO pages(source,batch,ordinal,path,digest,source_revision) VALUES(?,?,?,?,?,?)",
+                                [(manifest.source, manifest.batch, page.ordinal, page.path, page.sha256, revision)
+                                 for page, revision in zip(manifest.pages, bindings)])
             self.event("batch_registered", manifest.source, manifest.batch, None,
-                       {"manifest_hash": digest, "page_count": len(manifest.pages)})
+                       {"manifest_hash": digest, "page_count": len(manifest.pages),
+                        "revisions": sorted(set(bindings))})
         return self.batch(manifest.source, manifest.batch)
 
     def batch(self, source: str, batch: str) -> dict:
@@ -185,14 +266,15 @@ class Ledger:
                 return {"ordinal": ordinal, "unchanged": True, "records": row["record_count"]}
             captured = self.db.execute("SELECT captured_at FROM batches WHERE source=? AND batch=?",
                                        (source, batch)).fetchone()[0]
+            revision = row["source_revision"]
             for record, raw, status, reasons in items:
                 previous = self.db.execute("SELECT version FROM source_records WHERE source=? AND record_id=?",
                                            (source, record.source_record_id)).fetchone()
                 version = previous[0] + 1 if previous else 1
-                cursor = self.db.execute("INSERT INTO observations(source,batch,ordinal,record_id,identity,record_json,raw_json,raw_digest,status,reasons,version,captured_at,observed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                cursor = self.db.execute("INSERT INTO observations(source,batch,ordinal,record_id,identity,record_json,raw_json,raw_digest,status,reasons,version,captured_at,observed_at,source_revision) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                                          (source, batch, ordinal, record.source_record_id, record.identity,
                                           canonical(record.document()), canonical(raw), record.raw_digest,
-                                          status, canonical(reasons), version, captured, utc_now()))
+                                          status, canonical(reasons), version, captured, utc_now(), revision))
                 self.db.execute("INSERT INTO source_records(source,record_id,version,latest_observation) VALUES(?,?,?,?) ON CONFLICT(source,record_id) DO UPDATE SET version=excluded.version,latest_observation=excluded.latest_observation",
                                 (source, record.source_record_id, version, cursor.lastrowid))
             self.db.execute("UPDATE pages SET state='complete',attempts=attempts+1,error_code=NULL,error_detail=NULL,processed_at=?,record_count=? WHERE source=? AND batch=? AND ordinal=?",

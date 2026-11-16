@@ -91,13 +91,16 @@ class OperationsTests(unittest.TestCase):
         self.assertEqual(self.work.ledger.source("company").trust, 95)
         self.assertEqual(self.work.harvester.register_source(declaration)["revision"], 2)
 
-    def test_source_contract_freezes_after_ingest(self):
+    def test_source_contract_change_creates_new_revision(self):
         self.work.ingest()
         declaration = source()
         declaration["field_map"] = {"title": "position"}
-        with self.assertRaises(HarvestError) as caught:
-            self.work.harvester.register_source(declaration)
-        self.assertEqual(caught.exception.code, "source_contract_frozen")
+        result = self.work.harvester.register_source(declaration)
+        self.assertEqual(result["revision"], 2)
+        self.assertEqual(self.work.ledger.current_revision("company"), 2)
+        self.assertEqual(self.work.ledger.source("company").field_map, {"title": "position"})
+        self.assertEqual(self.work.ledger.source_at("company", 1).field_map, {})
+        self.assertEqual(self.work.ledger.page("company", "batch-1", 1)["source_revision"], 1)
 
     def test_cross_format_json_csv_html(self):
         self.work.register(key="campus", fmt="csv", kind="program")

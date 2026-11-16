@@ -63,7 +63,23 @@ class Auditor:
             return [Finding("error", "source_contract", location, str(exc))]
         if row["revision"] < 1:
             return [Finding("error", "source_revision", location, "revision must be positive")]
-        return []
+        result: list[Finding] = []
+        revisions = [item[0] for item in self.ledger.db.execute(
+            "SELECT revision FROM source_revisions WHERE source=? ORDER BY revision", (row["key"],))]
+        if revisions != list(range(1, row["revision"] + 1)):
+            result.append(Finding("error", "revision_chain", location,
+                                  "declaration revisions are not contiguous"))
+        else:
+            current = self.ledger.db.execute(
+                "SELECT * FROM source_revisions WHERE source=? AND revision=?",
+                (row["key"], row["revision"])).fetchone()
+            if (current["name"] != row["name"] or current["format"] != row["format"]
+                    or current["kind"] != row["kind"]
+                    or json.loads(current["field_map"]) != json.loads(row["field_map"])
+                    or current["trust"] != row["trust"]):
+                result.append(Finding("error", "revision_current", location,
+                                      "current declaration differs from sources row"))
+        return result
 
     def _batch(self, row: Any) -> list[Finding]:
         location = f"batch:{row['source']}/{row['batch']}"
@@ -79,13 +95,16 @@ class Auditor:
         except (HarvestError, ValueError, TypeError) as exc:
             result.append(Finding("error", "manifest_invalid", location, str(exc)))
             return result
-        pages = self.ledger.db.execute("SELECT ordinal,state,path,digest FROM pages WHERE source=? AND batch=? ORDER BY ordinal",
+        pages = self.ledger.db.execute("SELECT ordinal,state,path,digest,source_revision FROM pages WHERE source=? AND batch=? ORDER BY ordinal",
                                        (row["source"], row["batch"])).fetchall()
         if len(pages) != len(manifest.pages):
             result.append(Finding("error", "page_count", location, "page count differs from manifest"))
         for page, declared in zip(pages, manifest.pages):
             if page["ordinal"] != declared.ordinal or page["path"] != declared.path or page["digest"] != declared.sha256:
                 result.append(Finding("error", "page_declaration", location, f"page {declared.ordinal} differs"))
+            if declared.source_revision is not None and page["source_revision"] != declared.source_revision:
+                result.append(Finding("error", "page_revision", location,
+                                      f"page {declared.ordinal} binding differs from manifest"))
         if row["state"] == "complete" and (not pages or any(p["state"] != "complete" for p in pages)):
             result.append(Finding("error", "batch_state", location, "complete batch has incomplete page"))
         if pages and all(p["state"] == "complete" for p in pages) and row["state"] != "complete":
@@ -97,6 +116,13 @@ class Auditor:
     def _page(self, row: Any) -> list[Finding]:
         location = f"page:{row['source']}/{row['batch']}/{row['ordinal']}"
         result: list[Finding] = []
+        revision = row["source_revision"]
+        if revision is None:
+            result.append(Finding("error", "page_revision", location, "page has no declaration binding"))
+        elif not self.ledger.db.execute("SELECT 1 FROM source_revisions WHERE source=? AND revision=?",
+                                        (row["source"], revision)).fetchone():
+            result.append(Finding("error", "page_revision", location,
+                                  f"unknown source revision {revision}"))
         actual = self.ledger.db.execute("SELECT count(*) FROM observations WHERE source=? AND batch=? AND ordinal=?",
                                         (row["source"], row["batch"], row["ordinal"])).fetchone()[0]
         if row["state"] == "complete":
@@ -132,6 +158,11 @@ class Auditor:
             result.append(Finding("error", "record_version", location, "version must be positive"))
         if row["status"] not in {"accepted", "quarantined"}:
             result.append(Finding("error", "quality_status", location, "unexpected quality status"))
+        binding = self.ledger.db.execute("SELECT source_revision FROM pages WHERE source=? AND batch=? AND ordinal=?",
+                                         (row["source"], row["batch"], row["ordinal"])).fetchone()
+        if binding is not None and row["source_revision"] != binding["source_revision"]:
+            result.append(Finding("error", "observation_revision", location,
+                                  "observation revision differs from page binding"))
         return result
 
     def _record_cursor(self, row: Any) -> list[Finding]:

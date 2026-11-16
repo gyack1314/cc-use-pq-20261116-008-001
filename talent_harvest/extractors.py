@@ -6,7 +6,7 @@ from io import StringIO
 from typing import Any
 import json
 
-from .contracts import HarvestError, Source
+from .contracts import HarvestError, Source, required_columns
 
 
 class MirrorTable(HTMLParser):
@@ -47,6 +47,14 @@ class MirrorTable(HTMLParser):
             self._table_depth -= 1
 
 
+def check_headers(headers: list[str], required: frozenset[str] | None) -> None:
+    if required:
+        missing = sorted(set(required) - set(headers))
+        if missing:
+            raise HarvestError("layout_mismatch",
+                               f"page headers miss business columns: {','.join(missing)}")
+
+
 def parse_json(text: str) -> list[dict[str, Any]]:
     try:
         payload = json.loads(text)
@@ -61,12 +69,13 @@ def parse_json(text: str) -> list[dict[str, Any]]:
     return payload
 
 
-def parse_csv(text: str) -> list[dict[str, Any]]:
+def parse_csv(text: str, required: frozenset[str] | None = None) -> list[dict[str, Any]]:
     try:
         reader = DictReader(StringIO(text, newline=""), strict=True)
         headers = reader.fieldnames
         if not headers or any(not heading for heading in headers) or len(set(headers)) != len(headers):
             raise HarvestError("csv_headers", "CSV needs distinct nonempty headers")
+        check_headers(list(headers), required)
         rows = list(reader)
     except Exception as exc:
         if isinstance(exc, HarvestError):
@@ -77,7 +86,7 @@ def parse_csv(text: str) -> list[dict[str, Any]]:
     return rows
 
 
-def parse_html(text: str) -> list[dict[str, Any]]:
+def parse_html(text: str, required: frozenset[str] | None = None) -> list[dict[str, Any]]:
     parser = MirrorTable()
     try:
         parser.feed(text)
@@ -91,18 +100,29 @@ def parse_html(text: str) -> list[dict[str, Any]]:
     headers, *rows = parser.rows
     if len(set(headers)) != len(headers) or not all(headers):
         raise HarvestError("html_headers", "HTML table headers must be unique")
+    check_headers(headers, required)
     if any(len(row) != len(headers) for row in rows):
         raise HarvestError("html_columns", "HTML row width differs from header")
     return [dict(zip(headers, row)) for row in rows]
 
 
+def verify_json_layout(records: list[dict[str, Any]], source: Source) -> None:
+    needed = required_columns(source)
+    for index, row in enumerate(records, 1):
+        missing = sorted(needed - set(row))
+        if missing:
+            raise HarvestError("layout_mismatch",
+                               f"record {index} misses business columns: {','.join(missing)}")
+
+
 def extract(text: str, source: Source) -> list[dict[str, Any]]:
     if source.format == "json":
         records = parse_json(text)
+        verify_json_layout(records, source)
     elif source.format == "csv":
-        records = parse_csv(text)
+        records = parse_csv(text, required=required_columns(source))
     elif source.format == "html":
-        records = parse_html(text)
+        records = parse_html(text, required=required_columns(source))
     else:
         raise HarvestError("format", "unsupported source format")
     if len(records) > 10000:

@@ -46,6 +46,8 @@ def parser() -> ArgumentParser:
     actions.add_parser("operations", help="summarize batch and page progress")
     report = actions.add_parser("source-report", help="inspect source intake and quality")
     report.add_argument("source")
+    revisions = actions.add_parser("revisions", help="list declaration revisions of a source")
+    revisions.add_argument("source")
     actions.add_parser("sources", help="summarize all sources")
     quality = actions.add_parser("quality", help="summarize quarantine reasons")
     quality.add_argument("--source")
@@ -133,6 +135,8 @@ def execute(args: Namespace) -> dict:
             return Auditor(ledger).operational()
         if args.action == "source-report":
             return Inventory(ledger).source_report(args.source)
+        if args.action == "revisions":
+            return ledger.revisions(args.source)
         if args.action == "sources":
             return Inventory(ledger).records_by_source()
         if args.action == "quality":

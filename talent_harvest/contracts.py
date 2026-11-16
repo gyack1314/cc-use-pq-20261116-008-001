@@ -20,6 +20,8 @@ IDENT = re.compile(r"^[a-z][a-z0-9_-]{1,63}$")
 HEX = re.compile(r"^[a-f0-9]{64}$")
 FORMATS = {"json", "csv", "html"}
 KINDS = {"position", "program", "partnership"}
+REQUIRED_FIELDS = ("record_id", "organization", "title", "region", "discipline",
+                   "quantity", "published_at")
 
 
 def identifier(value: Any, field: str) -> str:
@@ -87,11 +89,17 @@ class Source:
         return asdict(self)
 
 
+def required_columns(source: "Source") -> frozenset[str]:
+    """Business columns a page must present under this declaration revision."""
+    return frozenset(source.field_map.get(field, field) for field in REQUIRED_FIELDS)
+
+
 @dataclass(frozen=True)
 class Page:
     ordinal: int
     path: str
     sha256: str
+    source_revision: int | None = None
 
     @classmethod
     def parse(cls, value: Any) -> "Page":
@@ -104,10 +112,16 @@ class Page:
             raise HarvestError("page_path", "page path must stay under manifest directory")
         if not isinstance(checksum, str) or not HEX.fullmatch(checksum):
             raise HarvestError("page_checksum", "sha256 must be 64 lowercase hex digits")
-        return cls(ordinal, path, checksum)
+        revision = value.get("source_revision")
+        if revision is not None and (type(revision) is not int or not 1 <= revision <= 1_000_000):
+            raise HarvestError("source_revision", "source_revision must be a positive integer")
+        return cls(ordinal, path, checksum, revision)
 
     def document(self) -> dict[str, Any]:
-        return asdict(self)
+        data: dict[str, Any] = {"ordinal": self.ordinal, "path": self.path, "sha256": self.sha256}
+        if self.source_revision is not None:
+            data["source_revision"] = self.source_revision
+        return data
 
 
 @dataclass(frozen=True)

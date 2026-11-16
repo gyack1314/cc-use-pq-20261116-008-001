@@ -20,10 +20,14 @@ class PageResult:
     records: int
     unchanged: bool
     error: str = ""
+    source_revision: int | None = None
 
     def document(self) -> dict[str, Any]:
-        return {"ordinal": self.ordinal, "state": self.state, "records": self.records,
-                "unchanged": self.unchanged, "error": self.error}
+        data: dict[str, Any] = {"ordinal": self.ordinal, "state": self.state, "records": self.records,
+                                "unchanged": self.unchanged, "error": self.error}
+        if self.source_revision is not None:
+            data["source_revision"] = self.source_revision
+        return data
 
 
 class Harvester:
@@ -38,20 +42,23 @@ class Harvester:
         path = Path(manifest_path)
         manifest = read_manifest(path)
         self.ledger.ensure_batch(manifest)
-        source = self.ledger.source(manifest.source)
         pages = [find_page(manifest, only_page)] if only_page is not None else manifest.pages
         outcomes: list[PageResult] = []
         for page in pages:
             existing = self.ledger.page(manifest.source, manifest.batch, page.ordinal)
+            revision = existing["source_revision"]
             if existing["state"] == "complete":
-                outcomes.append(PageResult(page.ordinal, "complete", existing["record_count"], True))
+                outcomes.append(PageResult(page.ordinal, "complete", existing["record_count"], True,
+                                           source_revision=revision))
                 continue
             try:
-                result = self._process(path.parent, manifest, source, page.ordinal)
-                outcomes.append(PageResult(page.ordinal, "complete", result["records"], result["unchanged"]))
+                result = self._process(path.parent, manifest, page.ordinal)
+                outcomes.append(PageResult(page.ordinal, "complete", result["records"],
+                                           result["unchanged"], source_revision=revision))
             except HarvestError as exc:
                 self.ledger.fail_page(manifest.source, manifest.batch, page.ordinal, exc)
-                outcomes.append(PageResult(page.ordinal, "failed", 0, False, str(exc)))
+                outcomes.append(PageResult(page.ordinal, "failed", 0, False, str(exc),
+                                           source_revision=revision))
                 if stop_on_error:
                     break
         batch = self.ledger.batch(manifest.source, manifest.batch)
@@ -60,8 +67,10 @@ class Harvester:
                 "completed_pages": sum(p["state"] == "complete" for p in batch["pages"]),
                 "total_pages": len(batch["pages"])}
 
-    def _process(self, base: Path, manifest: Manifest, source: Source, ordinal: int) -> dict:
+    def _process(self, base: Path, manifest: Manifest, ordinal: int) -> dict:
         page = find_page(manifest, ordinal)
+        binding = self.ledger.page(manifest.source, manifest.batch, ordinal)
+        source = self.ledger.source_at(manifest.source, binding["source_revision"])
         mirror = read_page(base, page)
         rows = extract(mirror.body, source)
         records = normalize_page(source, rows)
